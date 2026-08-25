@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+#
+# bfind - find files, with bioinformatics-aware shortcuts.
+#
+# A thin, predictable wrapper over find(1): every invocation builds one find
+# command, so behaviour stays inspectable (--dry-run prints it).
+#
+set -uo pipefail
+
+PROG=${0##*/}
+VERSION=0.1.0
+
+# ---------------------------------------------------------------- file classes
+# Keep these in one place: they are the whole point of the tool.
+declare -A CLASS_GLOBS=(
+  [bam]='*.bam *.cram *.sam'
+  [vcf]='*.vcf *.vcf.gz *.bcf *.gvcf *.gvcf.gz *.g.vcf *.g.vcf.gz'
+  [fastq]='*.fastq *.fq *.fastq.gz *.fq.gz'
+  [bed]='*.bed *.bed.gz *.bedpe *.interval_list'
+  [ref]='*.fa *.fasta *.fa.gz *.fasta.gz *.fna *.2bit *.dict *.genome'
+  [index]='*.bai *.crai *.tbi *.csi *.fai *.idx *.dict *.amb *.ann *.bwt *.pac'
+  [sheet]='*.xlsx *.xls *.csv *.tsv SampleSheet*.csv'
+  [log]='*.log *.err *.out *.stderr *.stdout'
+  [qc]='*.html *.zip *_fastqc* *.metrics *.flagstat *.stats *.idxstats'
+  [json]='*.json *.yaml *.yml'
+  [dx]='dxapp.json dxworkflow.json *.dxapp'
+)
+
+# Index suffix rules for --orphan-index, as "dataglob:index-candidates".
+# %B = basename with the data extension stripped, %F = full filename.
+declare -A INDEX_RULES=(
+  ['*.bam']='%F.bai %B.bai'
+  ['*.cram']='%F.crai %B.crai'
+  ['*.vcf.gz']='%F.tbi %F.csi'
+  ['*.bcf']='%F.csi'
+  ['*.gvcf.gz']='%F.tbi %F.csi'
+  ['*.g.vcf.gz']='%F.tbi %F.csi'
+  ['*.bed.gz']='%F.tbi'
+  ['*.fa']='%F.fai'
+  ['*.fasta']='%F.fai'
+  ['*.fa.gz']='%F.fai %F.gzi'
+)
+
+# Directories that are never worth walking on a bioinformatics box.
+PRUNE_DEFAULT=(.git .svn node_modules __pycache__ .pytest_cache .mypy_cache
+               .venv venv .cache .conda .nextflow .snakemake work
+               .terraform .tox .eggs dist build site-packages)
+
+die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+usage() {
+  cat <<HELPTEXT
+$PROG $VERSION - find files, with bioinformatics-aware shortcuts
+
+USAGE
+  $PROG [PATTERN] [PATH...] [OPTIONS]
+
+  PATTERN is matched case-insensitively against the file NAME. Bare words are
+  wrapped as *word*, so '$PROG NA12878' finds anything mentioning NA12878.
+  PATH defaults to the current directory.
+
+FILE CLASSES  (combine freely; multiple classes are OR'd)
+  --bam      .bam .cram .sam            --index    .bai .crai .tbi .csi .fai
+  --vcf      .vcf(.gz) .bcf .gvcf       --sheet    .xlsx .csv .tsv SampleSheet*
+  --fastq    .fastq .fq (.gz)           --log      .log .err .out
+  --bed      .bed .bedpe .interval_list --qc       fastqc, .stats, .flagstat
+  --ref      .fa .fasta .dict .2bit     --json     .json .yaml .yml
+  --dx       dxapp.json dxworkflow.json
+  --class C[,C..]                       explicit class list
+
+BIOINFORMATICS FILTERS
+  --sample ID[,ID..]   name contains any of these sample IDs (OR'd)
+  --orphan-index       data files with NO matching index (.bam without .bai,
+                       .vcf.gz without .tbi/.csi, .fa without .fai)
+  --paired             FASTQs whose R1/R2 mate is missing
+  --empty              zero-byte files (truncated pipeline output)
+
+SIZE / AGE
+  --bigger-than SIZE   e.g. 100M, 2G, 5k   (bare number = bytes)
+  --smaller-than SIZE
+  --newer-than AGE     e.g. 7 (days), 7d, 12h, 30m
+  --older-than AGE
+
+OUTPUT
+  -l, --long           size, mtime, path
+  -c, --count          print the number of matches only
+  -s, --sum            print total size of matches
+      --sort SPEC      size | -size | time | -time | path   (- = descending)
+      --head N         keep only the first N results
+  -0, --print0         NUL-separated (for xargs -0)
+  -x, --exec CMD       run CMD on results via xargs (use {} for the path)
+
+TRAVERSAL
+  -d, --depth N        max depth
+  -H, --hidden         include dotfiles/dirs (skipped by default)
+      --all            do not prune build/cache/env dirs
+      --follow         follow symlinks
+      --type T         f (default), d, l
+  -S, --case-sensitive make PATTERN case-sensitive
+      --regex RE       match full path against RE (find -regex)
+
+MISC
+      --dry-run        print the find command that would run
+  -h, --help / -V, --version
+
+EXAMPLES
+  $PROG --bam --orphan-index /data/runs        # BAMs missing an index
+  $PROG --vcf --sample NA12878,NA12891 ~/proj  # VCFs for two samples
+  $PROG --fastq --paired /seq/incoming         # unpaired FASTQs
+  $PROG --bam --bigger-than 5G --sort -size -l # biggest BAMs, largest first
+  $PROG SampleSheet --sheet ~ --newer-than 30d # recent samplesheets
+  $PROG --log --newer-than 1d -x 'grep -l ERROR {}'
+HELPTEXT
+}
+
+# ------------------------------------------------------------------- arg parse
+paths=() classes=() samples=() globs=() pattern= regex=
+maxdepth= ftype=f hidden=0 no_prune=0 follow=0 casesens=0
+orphan=0 paired=0 empty=0
+bigger= smaller= newer= older=
+long=0 count=0 sum=0 sortspec= headn= print0=0 execcmd= dryrun=0
+
+add_class() {
+  local c
+  for c in ${1//,/ }; do
+    [[ -v CLASS_GLOBS[$c] ]] || die "unknown class '$c' (see --help)"
+    classes+=("$c")
+  done
+}
+
+while (($#)); do
+  case $1 in
+    --bam|--vcf|--fastq|--bed|--ref|--index|--sheet|--log|--qc|--json|--dx)
+                      add_class "${1#--}" ;;
+    --class)          add_class "${2:?--class needs a value}"; shift ;;
+    --sample)         IFS=, read -ra _s <<<"${2:?--sample needs a value}"
+                      samples+=("${_s[@]}"); shift ;;
+    --orphan-index|--orphan) orphan=1 ;;
+    --paired)         paired=1 ;;
+    --empty)          empty=1 ;;
+    --bigger-than)    bigger=${2:?}; shift ;;
+    --smaller-than)   smaller=${2:?}; shift ;;
+    --newer-than)     newer=${2:?}; shift ;;
+    --older-than)     older=${2:?}; shift ;;
+    -l|--long)        long=1 ;;
+    -c|--count)       count=1 ;;
+    -s|--sum)         sum=1 ;;
+    --sort)           sortspec=${2:?}; shift ;;
+    --head)           headn=${2:?}; shift ;;
+    -0|--print0)      print0=1 ;;
+    -x|--exec)        execcmd=${2:?}; shift ;;
+    -d|--depth)       maxdepth=${2:?}; shift ;;
+    -H|--hidden)      hidden=1 ;;
+    --all)            no_prune=1 ;;
+    --follow)         follow=1 ;;
+    --type)           ftype=${2:?}; shift ;;
+    -S|--case-sensitive) casesens=1 ;;
+    --regex)          regex=${2:?}; shift ;;
+    --dry-run)        dryrun=1 ;;
+    -h|--help)        usage; exit 0 ;;
+    -V|--version)     echo "$PROG $VERSION"; exit 0 ;;
+    --)               shift; paths+=("$@"); break ;;
+    -*)               die "unknown option '$1' (see --help)" ;;
+    *)                # first bare word is the pattern, the rest are paths
+                      if [[ -z $pattern && ! -e $1 ]]; then pattern=$1
+                      else paths+=("$1"); fi ;;
+  esac
+  shift
+done
+
+((${#paths[@]})) || paths=(.)
+for p in "${paths[@]}"; do [[ -e $p ]] || die "no such path: $p"; done
+
+# ------------------------------------------------------- assemble find command
+for c in "${classes[@]}"; do
+  # shellcheck disable=SC2206
+  globs+=(${CLASS_GLOBS[$c]})
+done
+
+nameop=-iname; ((casesens)) && nameop=-name
+
+fargs=()
+((follow)) && fargs+=(-L)
+fargs+=("${paths[@]}")
+[[ -n $maxdepth ]] && fargs+=(-maxdepth "$maxdepth")
+
+# prune noise dirs, and dotfiles unless --hidden
+prunes=()
+((no_prune)) || prunes+=("${PRUNE_DEFAULT[@]}")
+if ((${#prunes[@]})); then
+  fargs+=('(' -type d '(')
+  first=1
+  for n in "${prunes[@]}"; do ((first)) || fargs+=(-o); fargs+=(-name "$n"); first=0; done
+  fargs+=(')' ')' -prune -o)
+fi
+((hidden)) || fargs+=('(' -name '.?*' -prune ')' -o)
+
+fargs+=(-type "$ftype")
+
+# class globs: OR group
+if ((${#globs[@]})); then
+  fargs+=('(')
+  first=1
+  for g in "${globs[@]}"; do ((first)) || fargs+=(-o); fargs+=("$nameop" "$g"); first=0; done
+  fargs+=(')')
+fi
+
+# pattern: bare words become *word*
+if [[ -n $pattern ]]; then
+  [[ $pattern == *[*?\[]* ]] || pattern="*${pattern}*"
+  fargs+=("$nameop" "$pattern")
+fi
+
+# sample IDs: OR group, AND'd with everything else
+if ((${#samples[@]})); then
+  fargs+=('(')
+  first=1
+  for s in "${samples[@]}"; do ((first)) || fargs+=(-o); fargs+=("$nameop" "*${s}*"); first=0; done
+  fargs+=(')')
+fi
+
+[[ -n $regex ]] && fargs+=(-regextype posix-extended -iregex "$regex")
+
+tosize() {  # 100M -> 100M ; 1024 -> 1024c
+  case $1 in
+    *[kKmMgGtT]) printf '%s' "${1^^}" ;;
+    *[0-9])      printf '%sc' "$1" ;;
+    *)           die "bad size '$1' (use 100M, 2G, 5k or a byte count)" ;;
+  esac
+}
+[[ -n $bigger  ]] && fargs+=(-size "+$(tosize "$bigger")")
+[[ -n $smaller ]] && fargs+=(-size "-$(tosize "$smaller")")
+
+toage() {  # emits two find args: -mtime/-mmin and the value
+  local v=$1 sign=$2 n unit
+  n=${v%[dhmDHM]}; unit=${v#"$n"}; unit=${unit,,}
+  [[ $n =~ ^[0-9]+$ ]] || die "bad age '$v' (use 7, 7d, 12h or 30m)"
+  case $unit in
+    ''|d) printf '%s\n%s\n' -mtime "${sign}${n}" ;;
+    h)    printf '%s\n%s\n' -mmin  "${sign}$((n * 60))" ;;
+    m)    printf '%s\n%s\n' -mmin  "${sign}${n}" ;;
+    *)    die "bad age unit in '$v'" ;;
+  esac
+}
+if [[ -n $newer ]]; then mapfile -t _a < <(toage "$newer" -); fargs+=("${_a[@]}"); fi
+if [[ -n $older ]]; then mapfile -t _a < <(toage "$older" +); fargs+=("${_a[@]}"); fi
+
+((empty)) && fargs+=(-size 0)
+
+fargs+=(-print0)
+
+if ((dryrun)); then
+  printf 'find'; printf ' %q' "${fargs[@]}"; printf '\n'
+  exit 0
+fi
+
+# ------------------------------------------------------------------- run + post
+mapfile -d '' -t hits < <(find "${fargs[@]}" 2>/dev/null)
+
+# --orphan-index: keep only data files whose index candidates are all absent
+if ((orphan)); then
+  kept=()
+  for f in "${hits[@]}"; do
+    base=${f##*/}; dir=${f%/*}; [[ $dir == "$f" ]] && dir=.
+    rule= 
+    for g in "${!INDEX_RULES[@]}"; do
+      # shellcheck disable=SC2053
+      [[ ${base,,} == ${g,,} ]] && { rule=${INDEX_RULES[$g]}; dataglob=$g; break; }
+    done
+    [[ -z $rule ]] && continue          # not an indexable data file
+    ext=${dataglob#\*}                  # e.g. .bam
+    stem=${base%"$ext"}
+    found=0
+    for cand in $rule; do
+      cand=${cand//%F/$base}; cand=${cand//%B/$stem}
+      [[ -e "$dir/$cand" ]] && { found=1; break; }
+    done
+    ((found)) || kept+=("$f")
+  done
+  hits=("${kept[@]}")
+fi
+
+# --paired: keep FASTQs whose R1/R2 mate is missing
+if ((paired)); then
+  kept=()
+  for f in "${hits[@]}"; do
+    mate=
+    case $f in
+      *_R1_*|*_R1.*) mate=${f/_R1/_R2} ;;
+      *_R2_*|*_R2.*) mate=${f/_R2/_R1} ;;
+      *_1.f*)        mate=${f/_1./_2.} ;;
+      *_2.f*)        mate=${f/_2./_1.} ;;
+      *)             continue ;;        # not obviously paired-end
+    esac
+    [[ -e $mate ]] || kept+=("$f")
+  done
+  hits=("${kept[@]}")
+fi
+
+((${#hits[@]})) || { ((count)) && echo 0; exit 1; }
+
+# sort: build "key<TAB>path" NUL-terminated records, sort, strip the key.
+# Note: stat -c does not expand \t, so the tab is written literally via $'..'.
+if [[ -n $sortspec ]]; then
+  key=${sortspec#-}; desc=0; [[ $sortspec == -* ]] && desc=1
+  case $key in
+    size) statfmt='%s' ;;
+    time) statfmt='%Y' ;;
+    path) statfmt=''   ;;
+    *)    die "bad --sort '$sortspec' (size|time|path, prefix - to reverse)" ;;
+  esac
+  # Numeric keys are zero-padded so a plain lexicographic `sort -z` orders them
+  # correctly. `sort -z -t<TAB> -k1,1n` does NOT work here: the numeric key
+  # compares equal for every record and -r then merely reverses input order.
+  sk=(); ((desc)) && sk=(-r)
+  mapfile -d '' -t hits < <(
+    for f in "${hits[@]}"; do
+      if [[ -n $statfmt ]]; then
+        printf '%020d\t%s\0' "$(stat -c "$statfmt" -- "$f" 2>/dev/null || echo 0)" "$f"
+      else
+        printf '%s\t%s\0' "$f" "$f"
+      fi
+    done | sort -z ${sk[0]+"${sk[@]}"} | cut -z -f2-
+  )
+fi
+
+[[ -n $headn ]] && hits=("${hits[@]:0:$headn}")
+
+# output modes
+if ((count)); then
+  echo "${#hits[@]}"
+elif ((sum)); then
+  total=0
+  for f in "${hits[@]}"; do total=$((total + $(stat -c %s -- "$f" 2>/dev/null || echo 0))); done
+  numfmt --to=iec --suffix=B "$total" 2>/dev/null || echo "${total}B"
+  printf '%s file(s)\n' "${#hits[@]}" >&2
+elif [[ -n $execcmd ]]; then
+  if [[ $execcmd == *'{}'* ]]; then
+    printf '%s\0' "${hits[@]}" | xargs -0 -I{} sh -c "$execcmd"
+  else
+    printf '%s\0' "${hits[@]}" | xargs -0 sh -c "$execcmd \"\$@\"" sh
+  fi
+elif ((print0)); then
+  printf '%s\0' "${hits[@]}"
+elif ((long)); then
+  # One numfmt for the whole stream; per-line pipes to numfmt are not worth it.
+  for f in "${hits[@]}"; do stat -c $'%s\t%y\t%n' -- "$f" 2>/dev/null; done \
+    | numfmt --to=iec --suffix=B --field=1 --delimiter=$'\t' 2>/dev/null \
+    | awk -F'\t' '{ printf "%9s  %s  %s\n", $1, substr($2,1,16), $3 }'
+else
+  printf '%s\n' "${hits[@]}"
+fi

@@ -1,0 +1,38 @@
+# Sandbox/editor placeholders that appear as char devices in this dir
+.bashrc
+.bash_profile
+.profile
+.zshrc
+.zprofile
+.gitconfig
+.gitmodules
+.ripgreprc
+.mcp.json
+
+# Editor / IDE
+.idea
+.vscode
+*.swp
+
+# Claude Code local state
+.claude/settings.local.json
+.claude/.cc-writes/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Bio data - never commit these
+*.bam
+*.cram
+*.vcf
+*.vcf.gz
+*.fastq
+*.fastq.gz
+*.fq.gz
+*.bai
+*.crai
+*.tbi
+.claude/
