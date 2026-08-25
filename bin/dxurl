@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+#
+# dxurl - turn DNAnexus object IDs into platform URLs (and back).
+#
+# Successor to dx-url. Differences that matter in practice:
+#   * class prefix is case-insensitive ("Job-xxx" works; the hash stays exact)
+#   * handles project-, applet-, workflow-, database-, app-, container-
+#   * accepts the composite "project-X:file-Y" form that `dx find data --brief`
+#     emits, and uses the project from it instead of calling the API
+#   * many IDs at once, from argv or stdin, describes run in parallel
+#   * --md / --html / --tsv / --json output for documentation
+#   * clipboard is no longer a surprise: it fires for a single result on a TTY
+#
+set -uo pipefail
+
+PROG=${0##*/}
+VERSION=0.1.0
+BASE=${DXURL_BASE:-https://platform.dnanexus.com}
+
+die()    { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
+notice() { ((quiet)) || printf '%s\n' "$*" >&2; }
+
+# ------------------------------------------------- re-entrant describe worker
+# `dx describe` accepts one ID at a time, so parallelism comes from xargs -P
+# re-invoking this script. Output: id \t project \t name \t class
+if [[ ${1:-} == --_describe ]]; then
+  shift
+  for _id; do
+    if _j=$(dx describe --json "$_id" 2>/dev/null); then
+      jq -r '[.id // "", .project // "", .name // "", .class // ""] | @tsv' <<<"$_j" 2>/dev/null \
+        || printf '%s\t\t\t\n' "$_id"
+    else
+      printf '%s\t\t\t\n' "$_id"
+    fi
+  done
+  exit 0
+fi
+
+usage() {
+  cat <<HELPTEXT
+$PROG $VERSION - DNAnexus object IDs -> platform URLs
+
+USAGE
+  $PROG [OPTIONS] ID...
+  ... | $PROG [OPTIONS]            # reads IDs from stdin
+
+  ID may be a bare object ID (job-xxxx, file-xxxx, project-xxxx, ...), the
+  composite form project-xxxx:file-yyyy, or - with --reverse - a platform URL.
+  The class prefix is case-insensitive; the hash is left untouched.
+
+OUTPUT FORMATS
+  (default)        the URL, one per line
+  -m, --md         markdown link, [object name](url)
+  -H, --html       HTML anchor
+  -T, --tsv        id, name, url  (tab separated)
+  -J, --json       one JSON object per line
+      --label TXT  override the link text (single ID only)
+
+BEHAVIOUR
+  -p, --project P  assume this project; skips the API call for job/file IDs
+  -n, --no-name    never call the API just to fetch a display name
+  -P, --parallel N concurrent describes (default 8)
+  -r, --reverse    input is a platform URL; print the object ID instead
+  -o, --open       also open each URL with xdg-open/open
+  -c, --copy       force copy to clipboard
+  -C, --no-copy    never copy to clipboard
+  -q, --quiet      suppress informational messages on stderr
+  -h, --help  -V, --version
+
+EXAMPLES
+  $PROG job-J98Kp9Q4XJPJjJpGy5YPk9Y9
+  $PROG Project-J9k05G04Pyg0PbVkyk98K10J          # case-insensitive prefix
+  dx find data --brief --name '*.vcf.gz' | $PROG --md   # doc-ready links
+  $PROG --md --project project-J9k0 job-J98K job-J93v   # no API calls needed
+  $PROG --reverse 'https://platform.dnanexus.com/panx/projects/ABC/monitor/job/XYZ'
+
+NOTE
+  The job/analysis/file URL shapes are the ones dx-url has been using in
+  anger. The project/applet/workflow/database/app shapes follow the same
+  /panx scheme but are less battle-tested - check one before bulk-linking.
+HELPTEXT
+}
+
+# ----------------------------------------------------------------- arg parsing
+ids=() fmt=plain proj_override= no_name=0 parallel=8 reverse=0
+do_open=0 copy=auto quiet=0 label=
+
+while (($#)); do
+  case $1 in
+    -m|--md|--markdown) fmt=md ;;
+    -H|--html)          fmt=html ;;
+    -T|--tsv)           fmt=tsv ;;
+    -J|--json)          fmt=json ;;
+    --label)            label=${2:?--label needs a value}; shift ;;
+    -p|--project)       proj_override=${2:?--project needs a value}; shift ;;
+    -n|--no-name)       no_name=1 ;;
+    -P|--parallel)      parallel=${2:?}; shift ;;
+    -r|--reverse)       reverse=1 ;;
+    -o|--open)          do_open=1 ;;
+    -c|--copy)          copy=always ;;
+    -C|--no-copy)       copy=never ;;
+    -q|--quiet)         quiet=1 ;;
+    -h|--help)          usage; exit 0 ;;
+    -V|--version)       echo "$PROG $VERSION"; exit 0 ;;
+    -)                  ids+=(-) ;;
+    --)                 shift; ids+=("$@"); break ;;
+    -*)                 die "unknown option '$1' (see --help)" ;;
+    *)                  ids+=("$1") ;;
+  esac
+  shift
+done
+
+# stdin when nothing was given, or when '-' appears
+if ((${#ids[@]} == 0)) || [[ " ${ids[*]} " == *" - "* ]]; then
+  ids=("${ids[@]/#-/}")
+  while read -r line; do
+    for tok in $line; do [[ -n $tok ]] && ids+=("$tok"); done
+  done
+  # drop the empties left by removing '-'
+  tmp=(); for i in "${ids[@]}"; do [[ -n $i ]] && tmp+=("$i"); done; ids=("${tmp[@]}")
+fi
+((${#ids[@]})) || { usage >&2; exit 2; }
+[[ -n $label && ${#ids[@]} -gt 1 ]] && die "--label only makes sense with a single ID"
+
+# ---------------------------------------------------------------- reverse mode
+if ((reverse)); then
+  for u in "${ids[@]}"; do
+    case $u in
+      *?id.values=*)     printf '%s\n' "${u##*id.values=}" | sed 's/&.*//' ;;
+      */monitor/job/*)      printf 'job-%s\n'      "$(sed 's|.*/monitor/job/||; s|[/?].*||' <<<"$u")" ;;
+      */monitor/analysis/*) printf 'analysis-%s\n' "$(sed 's|.*/monitor/analysis/||; s|[/?].*||' <<<"$u")" ;;
+      */panx/projects/*)    printf 'project-%s\n'  "$(sed 's|.*/panx/projects/||; s|[/?].*||' <<<"$u")" ;;
+      */app/*)              printf 'app-%s\n'      "$(sed 's|.*/app/||; s|[/?].*||' <<<"$u")" ;;
+      *) printf '%s: cannot extract an ID from: %s\n' "$PROG" "$u" >&2 ;;
+    esac
+  done
+  exit 0
+fi
+
+# ------------------------------------------------------------ normalise inputs
+# Lowercase ONLY the class prefix; DNAnexus hashes are case-sensitive.
+norm_id() {
+  local raw=$1 pre rest
+  if [[ $raw == *-* ]]; then
+    pre=${raw%%-*}; rest=${raw#*-}
+    printf '%s-%s' "${pre,,}" "$rest"
+  else
+    printf '%s' "$raw"
+  fi
+}
+
+declare -a OBJ PRJ
+for raw in "${ids[@]}"; do
+  if [[ $raw == *:* ]]; then                 # project-X:file-Y from dx find
+    OBJ+=("$(norm_id "${raw#*:}")"); PRJ+=("$(norm_id "${raw%%:*}")")
+  else
+    OBJ+=("$(norm_id "$raw")");      PRJ+=("${proj_override:+$(norm_id "$proj_override")}")
+  fi
+done
+
+# Which entries still need an API call? Projects and apps never need a project
+# lookup; everything else does, and --md/--html/--tsv/--json also want a name.
+declare -A DESC_PRJ DESC_NAME DESC_CLASS
+need=()
+wants_name=0
+[[ $fmt == md || $fmt == html || $fmt == tsv || $fmt == json ]] && wants_name=1
+((no_name)) && wants_name=0
+[[ -n $label ]] && wants_name=0
+
+for i in "${!OBJ[@]}"; do
+  o=${OBJ[$i]}
+  case $o in
+    project-*|container-*|app-*|globalworkflow-*) needs_proj=0 ;;
+    *) needs_proj=1 ;;
+  esac
+  if { ((needs_proj)) && [[ -z ${PRJ[$i]} ]]; } || ((wants_name)); then
+    need+=("$o")
+  fi
+done
+
+if ((${#need[@]})); then
+  while IFS=$'\t' read -r d_id d_prj d_name d_class; do
+    [[ -z $d_id ]] && continue
+    DESC_PRJ[$d_id]=$d_prj; DESC_NAME[$d_id]=$d_name; DESC_CLASS[$d_id]=$d_class
+  done < <(printf '%s\n' "${need[@]}" | sort -u | xargs -r -P "$parallel" -n1 "$0" --_describe)
+fi
+
+# ------------------------------------------------------------------ build URLs
+urls=() texts=()
+rc=0
+for i in "${!OBJ[@]}"; do
+  o=${OBJ[$i]}
+  p=${PRJ[$i]:-${DESC_PRJ[$o]:-}}
+  name=${DESC_NAME[$o]:-}
+  ph=${p#project-}; ph=${ph#container-}
+
+  url=
+  case $o in
+    project-*|container-*)
+      url="$BASE/panx/projects/${o#*-}/data" ;;
+    job-*)
+      [[ -n $ph ]] || { printf '%s: no project for %s (pass --project)\n' "$PROG" "$o" >&2; rc=1; continue; }
+      url="$BASE/panx/projects/$ph/monitor/job/${o#job-}" ;;
+    analysis-*)
+      [[ -n $ph ]] || { printf '%s: no project for %s (pass --project)\n' "$PROG" "$o" >&2; rc=1; continue; }
+      url="$BASE/panx/projects/$ph/monitor/analysis/${o#analysis-}" ;;
+    file-*|record-*|applet-*|workflow-*|database-*)
+      [[ -n $ph ]] || { printf '%s: no project for %s (pass --project)\n' "$PROG" "$o" >&2; rc=1; continue; }
+      url="$BASE/panx/projects/$ph/data/?scope=project&id.values=$o" ;;
+    app-*|globalworkflow-*)
+      # Apps are global; the UI addresses them by name, not by ID.
+      slug=${name:-${o#*-}}
+      url="$BASE/app/$slug" ;;
+    *)
+      printf '%s: unrecognised object type: %s\n' "$PROG" "$o" >&2; rc=1; continue ;;
+  esac
+
+  urls+=("$url")
+  texts+=("${label:-${name:-$o}}")
+done
+
+((${#urls[@]})) || exit "${rc:-1}"
+
+# --------------------------------------------------------------------- emit
+md_escape() { printf '%s' "${1//]/\\]}"; }
+html_escape() { local s=$1; s=${s//&/&amp;}; s=${s//</&lt;}; s=${s//>/&gt;}; s=${s//\"/&quot;}; printf '%s' "$s"; }
+
+for i in "${!urls[@]}"; do
+  u=${urls[$i]}; t=${texts[$i]}
+  case $fmt in
+    plain) printf '%s\n' "$u" ;;
+    md)    printf '[%s](%s)\n' "$(md_escape "$t")" "$u" ;;
+    html)  printf '<a href="%s">%s</a>\n' "$(html_escape "$u")" "$(html_escape "$t")" ;;
+    tsv)   printf '%s\t%s\t%s\n' "${OBJ[$i]}" "$t" "$u" ;;
+    json)  jq -cn --arg id "${OBJ[$i]}" --arg name "$t" --arg url "$u" \
+             --arg class "${DESC_CLASS[${OBJ[$i]}]:-}" \
+             '{id:$id, class:$class, name:$name, url:$url}' ;;
+  esac
+done
+
+# ----------------------------------------------------------------- clipboard
+should_copy=0
+case $copy in
+  always) should_copy=1 ;;
+  never)  should_copy=0 ;;
+  auto)   [[ -t 1 ]] && ((${#urls[@]} == 1)) && should_copy=1 ;;
+esac
+if ((should_copy)); then
+  payload=$(printf '%s\n' "${urls[@]}")
+  if   command -v xclip  >/dev/null 2>&1; then printf '%s' "$payload" | xclip -selection clipboard; notice "(copied)"
+  elif command -v wl-copy>/dev/null 2>&1; then printf '%s' "$payload" | wl-copy;                    notice "(copied)"
+  elif command -v pbcopy >/dev/null 2>&1; then printf '%s' "$payload" | pbcopy;                     notice "(copied)"
+  fi
+fi
+
+if ((do_open)); then
+  opener=$(command -v xdg-open || command -v open || true)
+  [[ -n $opener ]] || notice "no xdg-open/open available"
+  for u in "${urls[@]}"; do [[ -n $opener ]] && "$opener" "$u" >/dev/null 2>&1 & done
+  wait
+fi
+
+exit "$rc"
