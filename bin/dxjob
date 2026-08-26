@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""dxjob - job triage for DNAnexus.
+
+`dx describe job-xxxx` prints eighty fields when the question is almost always
+"did it work, how long did it take, what did it cost, and if it broke, why".
+This condenses that to a line, and puts the recurring `dx watch --no-follow |
+grep -E ...` pattern behind --log/--grep.
+
+Shells out to the dx CLI; no Python dependencies.
+"""
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = "0.1.0"
+
+STATE_COLOUR = {
+    "done": "32", "failed": "31", "terminated": "31", "running": "33",
+    "runnable": "36", "waiting_on_input": "36", "idle": "36",
+    "in_progress": "33", "partially_failed": "31",
+}
+TERMINAL_STATES = ("done", "failed", "terminated")
+
+
+def die(msg, code=2):
+    sys.stderr.write("dxjob: %s\n" % msg)
+    sys.exit(code)
+
+
+def colour(text, code, enabled):
+    if not enabled or not code:
+        return text
+    return "\033[%sm%s\033[0m" % (code, text)
+
+
+def dx_json(args):
+    """Run a dx command expected to emit JSON. Returns parsed data or None."""
+    try:
+        proc = subprocess.run(["dx"] + args, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, check=False)
+    except OSError as exc:
+        die("could not run dx: %s" % exc)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        return json.loads(proc.stdout.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+
+
+def describe(job_id):
+    data = dx_json(["describe", "--json", job_id])
+    if data is None:
+        die("could not describe %s" % job_id)
+    return data
+
+
+def fmt_duration(ms):
+    if not ms or ms < 0:
+        return "-"
+    secs = int(ms // 1000)
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return "%dh%02dm" % (h, m)
+    if m:
+        return "%dm%02ds" % (m, s)
+    return "%ds" % s
+
+
+def runtime_ms(d):
+    started = d.get("startedRunning")
+    stopped = d.get("stoppedRunning")
+    if not started:
+        return None
+    if not stopped:
+        stopped = int(time.time() * 1000)   # still running
+    return stopped - started
+
+
+def fmt_cost(d):
+    price = d.get("totalPrice")
+    if price is None:
+        return "-"
+    cur = d.get("currency") or {}
+    sym = {"USD": "$", "GBP": "£", "EUR": "€"}.get(cur.get("code"), "")
+    return "%s%.4f" % (sym, price)
+
+
+def human_bytes(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%.1f%s" % (n, unit)).replace(".0", "")
+        n /= 1024.0
+    return str(n)
+
+
+def fmt_when(ms):
+    if not ms:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ms / 1000.0))
+
+
+def summary_line(d, use_colour, wide=False):
+    state = d.get("state") or "?"
+    parts = [
+        colour("%-16s" % state, STATE_COLOUR.get(state), use_colour),
+        "%-9s" % fmt_duration(runtime_ms(d)),
+        "%9s" % fmt_cost(d),
+        "%-34s" % (d.get("executableName") or "-")[:34],
+        (d.get("name") or "-"),
+    ]
+    if wide:
+        parts.insert(0, d.get("id") or "-")
+    return "  ".join(parts)
+
+
+def print_detail(d, use_colour):
+    state = d.get("state") or "?"
+    w = lambda k, v: sys.stdout.write("%-16s %s\n" % (k + ":", v))
+    w("id", d.get("id"))
+    w("name", d.get("name"))
+    w("executable", "%s (%s)" % (d.get("executableName") or "-",
+                                 d.get("executable") or "-"))
+    w("state", colour(state, STATE_COLOUR.get(state), use_colour))
+    w("project", d.get("project"))
+    w("folder", d.get("folder"))
+    w("launched by", d.get("launchedBy"))
+    w("created", fmt_when(d.get("created")))
+    w("started", fmt_when(d.get("startedRunning")))
+    w("stopped", fmt_when(d.get("stoppedRunning")))
+    w("runtime", fmt_duration(runtime_ms(d)))
+    w("instance", d.get("instanceType"))
+    w("cost", fmt_cost(d))
+    egress = d.get("totalEgress")
+    if isinstance(egress, dict):
+        net = egress.get("internetEgress") or 0
+        if net:
+            w("internet egress", human_bytes(net))
+    elif egress:
+        w("egress", egress)
+    root = d.get("rootExecution")
+    if root and root != d.get("id"):
+        w("root", root)
+    if d.get("parentJob"):
+        w("parent", d.get("parentJob"))
+    if d.get("failureReason"):
+        w("FAILURE", colour(d["failureReason"], "31", use_colour))
+        if d.get("failureMessage"):
+            w("message", d["failureMessage"])
+
+
+def print_io(d, which):
+    payload = d.get(which) or {}
+    if not payload:
+        sys.stderr.write("dxjob: no %s\n" % which)
+        return 1
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def show_log(job_id, pattern=None, tail=None, follow=False):
+    cmd = ["dx", "watch", job_id]
+    if not follow:
+        cmd.append("--no-follow")
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        die("could not run dx watch: %s" % exc)
+    regex = None
+    if pattern:
+        import re
+        try:
+            regex = re.compile(pattern)
+        except re.error as exc:
+            die("bad --grep pattern: %s" % exc)
+    lines = []
+    assert proc.stdout is not None
+    for raw in proc.stdout:
+        line = raw.decode("utf-8", "replace").rstrip("\n")
+        if regex and not regex.search(line):
+            continue
+        if tail:
+            lines.append(line)
+        else:
+            print(line)
+            sys.stdout.flush()
+    proc.wait()
+    if tail:
+        for line in lines[-tail:]:
+            print(line)
+    return proc.returncode
+
+
+def find_jobs(state=None, num=20, project=None, origin=None, all_jobs=False):
+    cmd = ["find", "jobs", "--json", "-n", str(num)]
+    if state:
+        cmd += ["--state", state]
+    if origin:
+        cmd += ["--origin", origin, "--all-jobs"]
+    elif all_jobs:
+        cmd += ["--all-jobs"]
+    if project:
+        cmd += ["--project", project]
+    data = dx_json(cmd)
+    return data or []
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="dxjob", add_help=False,
+        description="Triage DNAnexus jobs: state, runtime, cost, failures, logs.",
+        epilog="examples:\n"
+               "  dxjob job-J98Kp9Q4XJPJjJpGy5YPk9Y9        one-line summary\n"
+               "  dxjob -l job-J98K                         full detail\n"
+               "  dxjob --recent 10                         last 10 jobs here\n"
+               "  dxjob --failed                            recent failures + reasons\n"
+               "  dxjob --log job-J98K --grep 'Total variants'\n"
+               "  dxjob --tree job-J98K                     job plus its subjobs\n"
+               "  dxjob --outputs job-J98K                  output JSON\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("jobs", nargs="*", help="job IDs (default: most recent job)")
+    ap.add_argument("-l", "--long", action="store_true", help="full detail block")
+    ap.add_argument("--recent", nargs="?", type=int, const=20, metavar="N",
+                    help="summarise the N most recent jobs (default 20)")
+    ap.add_argument("--failed", nargs="?", type=int, const=20, metavar="N",
+                    help="only recent failed jobs")
+    ap.add_argument("--running", nargs="?", type=int, const=20, metavar="N",
+                    help="only jobs currently running")
+    ap.add_argument("--tree", action="store_true", help="include subjobs")
+    ap.add_argument("--log", action="store_true", help="print the job log")
+    ap.add_argument("--watch", action="store_true", help="follow the log live")
+    ap.add_argument("--grep", metavar="RE", help="with --log, keep matching lines")
+    ap.add_argument("--tail", type=int, metavar="N", help="with --log, last N lines")
+    ap.add_argument("--inputs", action="store_true")
+    ap.add_argument("--outputs", action="store_true")
+    ap.add_argument("--url", action="store_true", help="platform URL (needs dxurl)")
+    ap.add_argument("-p", "--project")
+    ap.add_argument("-J", "--json", action="store_true", help="raw describe JSON")
+    ap.add_argument("-w", "--wide", action="store_true", help="include job IDs")
+    ap.add_argument("--no-colour", "--no-color", action="store_true")
+    ap.add_argument("-h", "--help", action="help")
+    ap.add_argument("-V", "--version", action="version", version="dxjob " + VERSION)
+    args = ap.parse_args()
+
+    if not shutil.which("dx"):
+        die("the dx CLI is not on PATH")
+    use_colour = sys.stdout.isatty() and not args.no_colour
+
+    # ------------------------------------------------ listing modes
+    listing = None
+    if args.failed is not None:
+        listing = find_jobs(state="failed", num=args.failed, project=args.project)
+    elif args.running is not None:
+        listing = find_jobs(state="running", num=args.running, project=args.project)
+    elif args.recent is not None:
+        listing = find_jobs(num=args.recent, project=args.project, all_jobs=True)
+
+    if listing is not None:
+        if not listing:
+            sys.stderr.write("dxjob: no matching jobs\n")
+            return 1
+        for rec in listing:
+            d = rec.get("describe") or rec
+            if not d.get("state"):
+                d = describe(rec.get("id") or "")
+            print(summary_line(d, use_colour, wide=args.wide or True))
+            if d.get("failureReason"):
+                print("    %s %s" % (
+                    colour(d["failureReason"], "31", use_colour),
+                    (d.get("failureMessage") or "")[:160]))
+        return 0
+
+    # ------------------------------------------------ job-targeted modes
+    job_ids = args.jobs
+    if not job_ids:
+        recent = find_jobs(num=1, project=args.project, all_jobs=True)
+        if not recent:
+            die("no job ID given and no recent job found")
+        job_ids = [recent[0].get("id")]
+
+    if args.url:
+        rc = subprocess.run(["dxurl"] + job_ids, check=False).returncode
+        return rc
+
+    if args.log or args.watch:
+        if len(job_ids) != 1:
+            die("--log/--watch take a single job")
+        return show_log(job_ids[0], pattern=args.grep, tail=args.tail,
+                        follow=args.watch)
+
+    rc = 0
+    for jid in job_ids:
+        d = describe(jid)
+        if args.json:
+            print(json.dumps(d, indent=2, sort_keys=True))
+        elif args.inputs:
+            rc |= print_io(d, "originalInput")
+        elif args.outputs:
+            rc |= print_io(d, "output")
+        elif args.long:
+            print_detail(d, use_colour)
+            if len(job_ids) > 1:
+                print()
+        else:
+            print(summary_line(d, use_colour, wide=args.wide))
+
+        if args.tree:
+            subs = find_jobs(origin=d.get("rootExecution") or jid, num=200)
+            for rec in subs:
+                sd = rec.get("describe") or rec
+                if sd.get("id") == d.get("id"):
+                    continue
+                print("  " + summary_line(sd, use_colour, wide=True))
+        if d.get("state") == "failed":
+            rc = 1
+    return rc
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)
