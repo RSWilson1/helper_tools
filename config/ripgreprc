@@ -1,0 +1,40 @@
+# ripgrep defaults tuned for bioinformatics work.
+# Activate with:  export RIPGREP_CONFIG_PATH="$HOME/.ripgreprc"
+
+--smart-case
+--max-columns=250
+--max-columns-preview
+
+# Custom file types, so `rg -tvcf CHROM` and friends work.
+--type-add=vcf:*.vcf,*.vcf.gz,*.bcf,*.gvcf.gz,*.g.vcf.gz
+--type-add=fastq:*.fastq,*.fq,*.fastq.gz,*.fq.gz
+--type-add=bed:*.bed,*.bed.gz,*.interval_list
+--type-add=sam:*.sam,*.bam,*.cram
+--type-add=dx:dxapp.json,dxworkflow.json
+--type-add=nf:*.nf,nextflow.config
+--type-add=smk:*.smk,Snakefile
+
+# Never scan these: binary, huge, or generated. Uncompressed .vcf and .bed are
+# deliberately NOT excluded - they are text and worth grepping.
+--glob=!*.bam
+--glob=!*.cram
+--glob=!*.bai
+--glob=!*.crai
+--glob=!*.tbi
+--glob=!*.csi
+--glob=!*.fai
+--glob=!*.fastq.gz
+--glob=!*.fq.gz
+--glob=!*.fa
+--glob=!*.fa.gz
+--glob=!*.fasta
+--glob=!*.fasta.gz
+--glob=!*.2bit
+--glob=!*.pyc
+--glob=!.git/
+--glob=!.snakemake/
+--glob=!.nextflow/
+--glob=!work/
+--glob=!node_modules/
+--glob=!__pycache__/
+--glob=!.venv/
