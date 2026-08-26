@@ -266,8 +266,12 @@ def main():
         for rec in listing:
             d = rec.get("describe") or rec
             if not d.get("state"):
-                d = describe(rec.get("id") or "")
-            print(summary_line(d, use_colour, wide=args.wide or True))
+                rid = rec.get("id")
+                if not rid:
+                    continue
+                d = describe(rid)
+            # listings always show the ID: you need it to act on the job
+            print(summary_line(d, use_colour, wide=True))
             if d.get("failureReason"):
                 print("    %s %s" % (
                     colour(d["failureReason"], "31", use_colour),
