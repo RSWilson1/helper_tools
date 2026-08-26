@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""dxf - a saner front end to `dx find data`.
+
+Two things it removes from day-to-day use:
+
+  * the --path "$PROJECT:$DIR" --name "..." --brief boilerplate, and
+  * hand-rolled BAM->BAI lookups. `--pair` resolves every data file to its
+    index in ONE extra query, instead of a `dx find data` call per BAM.
+
+It shells out to `dx find data --json` rather than importing dxpy, so it runs
+anywhere the dx CLI is on PATH with no Python dependencies at all.
+"""
+import argparse
+import concurrent.futures
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+VERSION = "0.1.0"
+
+CLASS_GLOBS = {
+    "bam":   ["*.bam", "*.cram", "*.sam"],
+    "vcf":   ["*.vcf", "*.vcf.gz", "*.bcf", "*.gvcf.gz", "*.g.vcf.gz"],
+    "fastq": ["*.fastq.gz", "*.fq.gz", "*.fastq", "*.fq"],
+    "bed":   ["*.bed", "*.bed.gz", "*.interval_list"],
+    "ref":   ["*.fa", "*.fasta", "*.fa.gz", "*.dict"],
+    "index": ["*.bai", "*.crai", "*.tbi", "*.csi", "*.fai"],
+    "sheet": ["*.xlsx", "*.csv", "*.tsv"],
+    "qc":    ["*.metrics", "*.flagstat", "*.stats", "*_fastqc.zip"],
+    "conf":  ["*.json", "*.yaml", "*.yml"],
+}
+
+# Longest suffix wins, so ".vcf.gz" is tried before ".gz" would be.
+# {full} = whole filename, {stem} = filename minus the data suffix.
+INDEX_RULES = [
+    (".vcf.gz",   ["{full}.tbi", "{full}.csi"]),
+    (".g.vcf.gz", ["{full}.tbi", "{full}.csi"]),
+    (".gvcf.gz",  ["{full}.tbi", "{full}.csi"]),
+    (".bed.gz",   ["{full}.tbi"]),
+    (".bam",      ["{full}.bai", "{stem}.bai"]),
+    (".cram",     ["{full}.crai", "{stem}.crai"]),
+    (".bcf",      ["{full}.csi"]),
+    (".fasta",    ["{full}.fai"]),
+    (".fa",       ["{full}.fai"]),
+]
+INDEX_GLOBS = ["*.bai", "*.crai", "*.tbi", "*.csi", "*.fai"]
+
+
+def die(msg, code=2):
+    sys.stderr.write("dxf: %s\n" % msg)
+    sys.exit(code)
+
+
+def dx_find(name_glob, project=None, folder=None, all_projects=False,
+            state=None, classname="file"):
+    """One `dx find data --json` call. Returns a list of raw records."""
+    cmd = ["dx", "find", "data", "--json", "--name", name_glob]
+    if classname:
+        cmd += ["--class", classname]
+    if all_projects:
+        cmd += ["--all-projects"]
+    elif project:
+        path = project + ":" + (folder or "/")
+        cmd += ["--path", path]
+    elif folder:
+        cmd += ["--path", folder]
+    if state:
+        cmd += ["--state", state]
+    try:
+        out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             check=False).stdout
+    except OSError as exc:
+        die("could not run dx: %s" % exc)
+    if not out.strip():
+        return []
+    try:
+        return json.loads(out.decode("utf-8", "replace"))
+    except ValueError:
+        return []
+
+
+def flatten(rec):
+    """dx find data --json record -> flat dict."""
+    d = rec.get("describe") or {}
+    return {
+        "id": rec.get("id") or d.get("id") or "",
+        "project": rec.get("project") or d.get("project") or "",
+        "name": d.get("name") or "",
+        "folder": d.get("folder") or "",
+        "size": d.get("size"),
+        "state": d.get("state") or "",
+        "modified": d.get("modified") or 0,
+    }
+
+
+def gather(globs, args, workers=8):
+    """Run the globs concurrently and merge, de-duplicating on object id."""
+    seen, out = set(), []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(dx_find, g, args.project, args.folder,
+                            args.all_projects, args.state) for g in globs]
+        for fut in futs:
+            for rec in fut.result():
+                flat = flatten(rec)
+                if flat["id"] and flat["id"] not in seen:
+                    seen.add(flat["id"])
+                    out.append(flat)
+    return out
+
+
+def index_candidates(name):
+    for suffix, patterns in INDEX_RULES:
+        if name.lower().endswith(suffix):
+            stem = name[: -len(suffix)]
+            return [p.format(full=name, stem=stem) for p in patterns]
+    return []
+
+
+def pair_up(data, indexes):
+    """Attach an index to each data file. Returns [(data, index_or_None)]."""
+    lookup = {}
+    for ix in indexes:
+        lookup[(ix["project"], ix["folder"], ix["name"])] = ix
+    paired = []
+    for d in data:
+        found = None
+        for cand in index_candidates(d["name"]):
+            found = lookup.get((d["project"], d["folder"], cand))
+            if found:
+                break
+        paired.append((d, found))
+    return paired
+
+
+def normalise_glob(pat):
+    """Bare words become *word*; anything with glob syntax is left alone."""
+    if not any(ch in pat for ch in "*?["):
+        return "*%s*" % pat
+    return pat
+
+
+def human(n):
+    if n is None:
+        return "-"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%.1f%s" % (n, unit)).replace(".0", "")
+        n /= 1024.0
+    return str(n)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="dxf", add_help=False,
+        description="Find data on DNAnexus without the --path/--name boilerplate.",
+        epilog="examples:\n"
+               "  dxf '*.vcf.gz'                       files in the current project\n"
+               "  dxf --bam -f /runs/run1              every BAM under a folder\n"
+               "  dxf --bam --pair                     each BAM with its .bai\n"
+               "  dxf --bam --pair --missing           BAMs with NO index\n"
+               "  dxf --vcf --sample 26058S0022 --md   doc-ready links\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    ap.add_argument("pattern", nargs="?", help="name glob; bare words become *word*")
+    for c in sorted(CLASS_GLOBS):
+        ap.add_argument("--" + c, action="store_true", help="match %s files" % c)
+    ap.add_argument("-p", "--project", help="project ID or name (default: current)")
+    ap.add_argument("-f", "--folder", help="folder to search under")
+    ap.add_argument("-A", "--all-projects", action="store_true")
+    ap.add_argument("--sample", help="comma-separated sample IDs, matched in the name")
+    ap.add_argument("--state", choices=["open", "closing", "closed"])
+    ap.add_argument("--pair", action="store_true", help="resolve each file's index")
+    ap.add_argument("--missing", action="store_true",
+                    help="with --pair, show only files whose index is absent")
+    ap.add_argument("--require-index", action="store_true",
+                    help="with --pair, exit 1 if any index is missing")
+    ap.add_argument("--sort", choices=["name", "size", "time"], default="name")
+    ap.add_argument("-R", "--reverse", action="store_true", help="reverse the sort")
+    ap.add_argument("--limit", type=int)
+    fmt = ap.add_mutually_exclusive_group()
+    fmt.add_argument("-b", "--brief", action="store_true", help="object IDs only (default)")
+    fmt.add_argument("-l", "--long", action="store_true", help="size, state, path")
+    fmt.add_argument("-T", "--tsv", action="store_true")
+    fmt.add_argument("-J", "--json", action="store_true")
+    fmt.add_argument("--paths", action="store_true", help="project:/folder/name")
+    fmt.add_argument("--names", action="store_true")
+    fmt.add_argument("--md", action="store_true", help="markdown links (needs dxurl)")
+    ap.add_argument("-c", "--count", action="store_true")
+    ap.add_argument("-s", "--sum", action="store_true", help="total size of matches")
+    ap.add_argument("-h", "--help", action="help")
+    ap.add_argument("-V", "--version", action="version", version="dxf " + VERSION)
+    args = ap.parse_args()
+
+    if not shutil.which("dx"):
+        die("the dx CLI is not on PATH")
+
+    globs = []
+    for c in sorted(CLASS_GLOBS):
+        if getattr(args, c.replace("-", "_")):
+            globs += CLASS_GLOBS[c]
+    # A bare pattern drives the query directly. Combined with class flags the
+    # classes drive the query and the pattern narrows the result client-side,
+    # because `dx find data` accepts only one --name.
+    pattern_is_query = False
+    if args.pattern and not globs:
+        globs = [normalise_glob(args.pattern)]
+        pattern_is_query = True
+    if not globs:
+        globs = ["*"]
+
+    data = gather(globs, args)
+
+    # client-side narrowing: pattern alongside classes, and --sample
+    if args.pattern and not pattern_is_query:
+        import fnmatch
+        pat = normalise_glob(args.pattern)
+        data = [d for d in data if fnmatch.fnmatch(d["name"].lower(), pat.lower())]
+    if args.sample:
+        wanted = [s.strip().lower() for s in args.sample.split(",") if s.strip()]
+        data = [d for d in data if any(w in d["name"].lower() for w in wanted)]
+
+    keyfn = {"name": lambda d: (d["folder"], d["name"]),
+             "size": lambda d: d["size"] or 0,
+             "time": lambda d: d["modified"]}[args.sort]
+    data.sort(key=keyfn, reverse=args.reverse)
+
+    paired = None
+    if args.pair:
+        indexes = gather(INDEX_GLOBS, args)
+        paired = pair_up(data, indexes)
+        if args.missing:
+            paired = [(d, i) for (d, i) in paired if i is None]
+            data = [d for (d, i) in paired]
+        else:
+            data = [d for (d, i) in paired]
+
+    if args.limit:
+        data = data[: args.limit]
+        if paired is not None:
+            paired = paired[: args.limit]
+
+    if args.count:
+        print(len(data))
+        return 0
+    if args.sum:
+        total = sum(d["size"] or 0 for d in data)
+        print(human(total))
+        sys.stderr.write("%d object(s)\n" % len(data))
+        return 0
+    if not data:
+        return 1
+
+    # ---------------------------------------------------------------- output
+    if args.md:
+        ids = ["%s:%s" % (d["project"], d["id"]) for d in data]
+        proc = subprocess.run(["dxurl", "--md"], input="\n".join(ids).encode(),
+                              stdout=subprocess.PIPE, check=False)
+        sys.stdout.write(proc.stdout.decode("utf-8", "replace"))
+        return 0
+
+    if paired is not None and not args.missing:
+        for d, ix in paired:
+            if args.json:
+                print(json.dumps({"data": d, "index": ix}))
+            elif args.tsv or args.long:
+                print("\t".join([d["id"], ix["id"] if ix else "-", d["name"]]))
+            else:
+                print("%s\t%s" % (d["id"], ix["id"] if ix else "-"))
+        if args.require_index and any(ix is None for _, ix in paired):
+            missing = sum(1 for _, ix in paired if ix is None)
+            sys.stderr.write("dxf: %d object(s) have no index\n" % missing)
+            return 1
+        return 0
+
+    for d in data:
+        if args.json:
+            print(json.dumps(d))
+        elif args.tsv:
+            print("\t".join([d["id"], d["name"], d["folder"], str(d["size"] or "")]))
+        elif args.long:
+            print("%-10s %8s  %s%s" % (d["state"], human(d["size"]),
+                                       d["folder"].rstrip("/") + "/", d["name"]))
+        elif args.paths:
+            print("%s:%s/%s" % (d["project"], d["folder"].rstrip("/"), d["name"]))
+        elif args.names:
+            print(d["name"])
+        else:
+            print(d["id"])
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
