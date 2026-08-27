@@ -91,6 +91,17 @@ Formats: default plain URL, `--md`, `--html`, `--tsv`, `--json`, `--label TXT`.
 Behaviour: `-p/--project` `-n/--no-name` `-P/--parallel N` `-r/--reverse`
 `-o/--open` `-c/--copy` `-C/--no-copy`.
 
+A mistyped ID is rejected locally — hash-based classes must carry 24
+alphanumeric characters — so a typo costs 10ms rather than a one-second round
+trip that comes back "not found" and blames permissions. `--no-validate` opts
+out. Names are cached under `~/.cache/dxurl` (`DXURL_CACHE_TTL`, default 30
+days), which takes a four-link document rebuild from ~2.4s to ~0.02s;
+`--refresh`, `--no-cache` and `--clear-cache` control it.
+
+`bin/dx-url` is a symlink to `dxurl`, so the old command name keeps working —
+`install.sh` puts this directory ahead of `/usr/local/bin` on `PATH`. The
+original `/usr/local/bin/dx-url` is left untouched.
+
 > The job, analysis and file URL shapes are the ones in daily use. The
 > project, applet, workflow, database and app shapes follow the same `/panx`
 > scheme but are less battle-tested — check one before bulk-linking.

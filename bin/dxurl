@@ -20,17 +20,50 @@ BASE=${DXURL_BASE:-https://platform.dnanexus.com}
 die()    { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
 notice() { ((quiet)) || printf '%s\n' "$*" >&2; }
 
+# Field separator for worker output and cache entries. Deliberately NOT a tab:
+# tab counts as IFS whitespace, so `IFS=$'\t' read` collapses runs of tabs and
+# an object with an empty .project (every app-) would shift its fields left.
+US=$'\x1f'
+
+CACHE_DIR=${DXURL_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/dxurl}
+CACHE_TTL=${DXURL_CACHE_TTL:-2592000}    # 30 days; 0 disables expiry
+
 # ------------------------------------------------- re-entrant describe worker
 # `dx describe` accepts one ID at a time, so parallelism comes from xargs -P
 # re-invoking this script. Output: id \t project \t name \t class
+#
+# Cache entries hold "project \t name \t class" and are keyed by object ID.
+# Flags reach this worker through the environment, since xargs owns its argv.
 if [[ ${1:-} == --_describe ]]; then
   shift
+  _no_cache=${DXURL_NO_CACHE:-0}
+  _refresh=${DXURL_REFRESH:-0}
+  _now=$(date +%s)
   for _id; do
+    _cf="$CACHE_DIR/$_id"
+    # read
+    if ((! _no_cache)) && ((! _refresh)) && [[ -f $_cf ]]; then
+      _mt=$(stat -c %Y "$_cf" 2>/dev/null || echo 0)
+      if ((CACHE_TTL == 0)) || (( _now - _mt < CACHE_TTL )); then
+        _cached=$(<"$_cf")
+        if [[ -n $_cached ]]; then
+          printf '%s%s%s\n' "$_id" "$US" "$_cached"
+          continue
+        fi
+      fi
+    fi
+    # miss: ask the API
     if _j=$(dx describe --json "$_id" 2>/dev/null); then
-      jq -r '[.id // "", .project // "", .name // "", .class // ""] | @tsv' <<<"$_j" 2>/dev/null \
-        || printf '%s\t\t\t\n' "$_id"
+      _rec=$(jq -r '[.project // "", .name // "", .class // ""] | join("\u001f")' <<<"$_j" 2>/dev/null)
     else
-      printf '%s\t\t\t\n' "$_id"
+      _rec=""
+    fi
+    printf '%s%s%s\n' "$_id" "$US" "$_rec"
+    # write, best effort: a unusable cache must never break a lookup
+    if ((! _no_cache)) && [[ -n $_rec ]] && mkdir -p "$CACHE_DIR" 2>/dev/null; then
+      if printf '%s' "$_rec" > "$_cf.$$.tmp" 2>/dev/null; then
+        mv -f "$_cf.$$.tmp" "$_cf" 2>/dev/null || rm -f "$_cf.$$.tmp" 2>/dev/null
+      fi
     fi
   done
   exit 0
@@ -67,6 +100,15 @@ BEHAVIOUR
   -q, --quiet      suppress informational messages on stderr
   -h, --help  -V, --version
 
+CACHING
+  Object names are cached under \$XDG_CACHE_HOME/dxurl (default ~/.cache/dxurl)
+  for DXURL_CACHE_TTL seconds (default 30 days, 0 = never expire), so rebuilding
+  a document's links does not re-query every ID.
+      --refresh    ignore cached names and re-describe
+      --no-cache   neither read nor write the cache
+      --clear-cache  delete the cache and exit
+      --no-validate  skip the local ID sanity check
+
 EXAMPLES
   $PROG job-J98Kp9Q4XJPJjJpGy5YPk9Y9
   $PROG Project-J9k05G04Pyg0PbVkyk98K10J          # case-insensitive prefix
@@ -83,7 +125,7 @@ HELPTEXT
 
 # ----------------------------------------------------------------- arg parsing
 ids=() fmt=plain proj_override= no_name=0 parallel=8 reverse=0
-do_open=0 copy=auto quiet=0 label=
+do_open=0 copy=auto quiet=0 label= no_cache=0 refresh=0 validate=1
 
 while (($#)); do
   case $1 in
@@ -100,6 +142,10 @@ while (($#)); do
     -c|--copy)          copy=always ;;
     -C|--no-copy)       copy=never ;;
     -q|--quiet)         quiet=1 ;;
+    --refresh)          refresh=1 ;;
+    --no-cache)         no_cache=1 ;;
+    --no-validate)      validate=0 ;;
+    --clear-cache)      rm -rf -- "$CACHE_DIR" && echo "removed $CACHE_DIR"; exit 0 ;;
     -h|--help)          usage; exit 0 ;;
     -V|--version)       echo "$PROG $VERSION"; exit 0 ;;
     -)                  ids+=(-) ;;
@@ -149,14 +195,51 @@ norm_id() {
   fi
 }
 
-declare -a OBJ PRJ
+# Catch a mistyped ID here rather than spending a second on an API round trip
+# that comes back "not found" and blames permissions. Hash-based classes carry
+# exactly 24 alphanumeric characters; app/globalworkflow may instead be named,
+# and user/org are always named.
+HASH_CLASSES=' project container file record applet workflow database job analysis '
+NAMED_OK=' app globalworkflow user org '
+validate_id() {
+  local id=$1 cls hash
+  ((validate)) || return 0
+  if [[ $id != *-* ]]; then
+    printf '%s: not a DNAnexus object ID: %s\n' "$PROG" "$id" >&2
+    return 1
+  fi
+  cls=${id%%-*}; hash=${id#*-}
+  if [[ -z $hash ]]; then
+    printf '%s: %s has an empty ID body\n' "$PROG" "$id" >&2
+    return 1
+  fi
+  if [[ $HASH_CLASSES == *" $cls "* ]]; then
+    if [[ ! $hash =~ ^[0-9A-Za-z]{24}$ ]]; then
+      printf '%s: malformed %s ID: expected 24 alphanumeric characters, got %d (%s)\n' \
+        "$PROG" "$cls" "${#hash}" "$hash" >&2
+      return 1
+    fi
+  elif [[ $NAMED_OK != *" $cls "* ]]; then
+    printf '%s: unknown object class %q in %s\n' "$PROG" "$cls" "$id" >&2
+    return 1
+  fi
+  return 0
+}
+
+OBJ=() PRJ=()   # not `declare -a`: that leaves them unset, which trips set -u
+bad=0
 for raw in "${ids[@]}"; do
   if [[ $raw == *:* ]]; then                 # project-X:file-Y from dx find
-    OBJ+=("$(norm_id "${raw#*:}")"); PRJ+=("$(norm_id "${raw%%:*}")")
+    o=$(norm_id "${raw#*:}"); pj=$(norm_id "${raw%%:*}")
+    validate_id "$o" && validate_id "$pj" || { bad=1; continue; }
+    OBJ+=("$o"); PRJ+=("$pj")
   else
-    OBJ+=("$(norm_id "$raw")");      PRJ+=("${proj_override:+$(norm_id "$proj_override")}")
+    o=$(norm_id "$raw")
+    validate_id "$o" || { bad=1; continue; }
+    OBJ+=("$o"); PRJ+=("${proj_override:+$(norm_id "$proj_override")}")
   fi
 done
+((${#OBJ[@]})) || exit 2
 
 # Which entries still need an API call? Projects and apps never need a project
 # lookup; everything else does, and --md/--html/--tsv/--json also want a name.
@@ -169,20 +252,26 @@ wants_name=0
 
 for i in "${!OBJ[@]}"; do
   o=${OBJ[$i]}
+  needs_name_here=$wants_name
   case $o in
-    project-*|container-*|app-*|globalworkflow-*) needs_proj=0 ;;
+    project-*|container-*) needs_proj=0 ;;
+    app-*|globalworkflow-*)
+      # the UI addresses these by name, so the name is part of the URL itself
+      needs_proj=0; ((no_name)) || needs_name_here=1 ;;
     *) needs_proj=1 ;;
   esac
-  if { ((needs_proj)) && [[ -z ${PRJ[$i]} ]]; } || ((wants_name)); then
+  if { ((needs_proj)) && [[ -z ${PRJ[$i]} ]]; } || ((needs_name_here)); then
     need+=("$o")
   fi
 done
 
 if ((${#need[@]})); then
-  while IFS=$'\t' read -r d_id d_prj d_name d_class; do
+  while IFS=$US read -r d_id d_prj d_name d_class; do
     [[ -z $d_id ]] && continue
     DESC_PRJ[$d_id]=$d_prj; DESC_NAME[$d_id]=$d_name; DESC_CLASS[$d_id]=$d_class
-  done < <(printf '%s\n' "${need[@]}" | sort -u | xargs -r -P "$parallel" -n1 "$0" --_describe)
+  done < <(printf '%s\n' "${need[@]}" | sort -u \
+             | DXURL_NO_CACHE=$no_cache DXURL_REFRESH=$refresh \
+               xargs -r -P "$parallel" -n1 "$0" --_describe)
 fi
 
 # ------------------------------------------------------------------ build URLs
@@ -219,6 +308,7 @@ for i in "${!OBJ[@]}"; do
   texts+=("${label:-${name:-$o}}")
 done
 
+((bad)) && rc=1
 ((${#urls[@]})) || exit "${rc:-1}"
 
 # --------------------------------------------------------------------- emit
