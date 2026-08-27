@@ -168,6 +168,20 @@ dxjob --watch job-J98K               # follow live
 States are colourised on a TTY. A named job in state `failed` makes `dxjob`
 exit non-zero, so it composes in scripts.
 
+## Tests
+
+```bash
+./tests/run.sh            # all four tools, 121 assertions
+./tests/run.sh dxurl      # just one file
+```
+
+No test framework and no platform access required. `bfind` is tested against
+real fixture trees; the three `dx*` tools run against `tests/stub/dx`, a stand-in
+that serves canned JSON from a fixture directory and logs each invocation, so a
+test can assert that a code path made **no** API call at all — which is how the
+"composite `project-X:file-Y` skips the API" and "a warm cache does not
+re-query" guarantees are enforced rather than just claimed.
+
 ## Configuration
 
 `config/ripgreprc` gives `rg` bioinformatics-aware defaults: custom types

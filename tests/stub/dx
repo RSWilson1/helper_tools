@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Stand-in for the dx CLI, so the dx* tools can be tested with no platform
+# access. Reads canned responses from $DX_STUB_DIR and logs each invocation to
+# $DX_STUB_CALLS so tests can assert that a code path made NO API call.
+set -uo pipefail
+: "${DX_STUB_DIR:?dx stub needs DX_STUB_DIR}"
+[[ -n ${DX_STUB_CALLS:-} ]] && printf '%s\n' "$*" >> "$DX_STUB_CALLS"
+
+sub="${1:-}${2:+ $2}"
+case $sub in
+  "describe --json"|"describe")
+    # last argument is the object ID
+    for a in "$@"; do id=$a; done
+    f="$DX_STUB_DIR/describe/$id.json"
+    [[ -f $f ]] || { echo "stub: no such object: $id" >&2; exit 1; }
+    cat "$f" ;;
+  "find data")
+    # honour --name so class/pattern queries can be told apart
+    name='*'
+    while (($#)); do [[ $1 == --name ]] && { name=$2; shift; }; shift; done
+    f="$DX_STUB_DIR/find_data/${name//\*/STAR}.json"
+    [[ -f $f ]] || f="$DX_STUB_DIR/find_data/default.json"
+    [[ -f $f ]] && cat "$f" || echo '[]' ;;
+  "find jobs"|"find executions")
+    state=""
+    while (($#)); do [[ $1 == --state ]] && { state=$2; shift; }; shift; done
+    f="$DX_STUB_DIR/find_jobs${state:+_$state}.json"
+    [[ -f $f ]] || f="$DX_STUB_DIR/find_jobs.json"
+    [[ -f $f ]] && cat "$f" || echo '[]' ;;
+  "watch"*)
+    cat "$DX_STUB_DIR/watch.log" 2>/dev/null || true ;;
+  *)
+    echo "stub: unhandled: $*" >&2; exit 2 ;;
+esac
